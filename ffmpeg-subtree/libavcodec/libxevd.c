@@ -334,6 +334,8 @@ static int libxevd_receive_frame(AVCodecContext *avctx, AVFrame *frame)
                     goto ERR;
                 }
 
+                av_log(avctx, AV_LOG_ERROR, "POC: %d\n", stat.poc);
+
                 bs_read_pos += nalu_size;
                 dec_read_bytes += nalu_size;
 
