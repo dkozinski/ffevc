@@ -25,6 +25,7 @@
 #include "libavutil/common.h"
 #include "parser.h"
 #include "golomb.h"
+#include "bytestream.h"
 #include "evc.h"
 
 #define EVC_MAX_QP_TABLE_SIZE   58
@@ -310,6 +311,8 @@ typedef struct EVCParserContext {
     EVCParserPoc poc;
 
     int parsed_extradata;
+    int is_evc;
+    int nal_length_size;
 
 } EVCParserContext;
 
@@ -841,6 +844,281 @@ static EVCParserSliceHeader *parse_slice_header(const uint8_t *bs, int bs_size, 
     return sh;
 }
 
+#if 0
+static int packet_split(const uint8_t *buf, int length,
+                          void *logctx, int is_evc, int nal_length_size,
+                          int small_padding, int use_ref)
+{
+    GetByteContext bc;
+    int consumed, ret = 0;
+    int next_evc = is_evc ? 0 : length;
+    
+    bytestream2_init(&bc, buf, length);
+    // alloc_rbsp_buffer(&pkt->rbsp, length + padding, use_ref);
+
+    //if (!pkt->rbsp.rbsp_buffer)
+    //    return AVERROR(ENOMEM);
+
+    // pkt->rbsp.rbsp_buffer_size = 0;
+    // pkt->nb_nals = 0;
+    int nb_nals = 0;
+    while (bytestream2_get_bytes_left(&bc) >= 4) {
+        H2645NAL *nal;
+        int extract_length = 0;
+        int skip_trailing_zeros = 1;
+
+        if (bytestream2_tell(&bc) == next_evc) {
+            int i = 0;
+            extract_length = get_nalsize(nal_length_size,
+                                         bc.buffer, bytestream2_get_bytes_left(&bc), &i, logctx);
+            if (extract_length < 0)
+                return extract_length;
+
+            bytestream2_skip(&bc, nal_length_size);
+
+            next_avc = bytestream2_tell(&bc) + extract_length;
+        } else {
+            int buf_index;
+
+            if (bytestream2_tell(&bc) > next_avc)
+                av_log(logctx, AV_LOG_WARNING, "Exceeded next NALFF position, re-syncing.\n");
+
+            /* search start code */
+            buf_index = find_next_start_code(bc.buffer, buf + next_avc);
+
+            bytestream2_skip(&bc, buf_index);
+
+            if (!bytestream2_get_bytes_left(&bc)) {
+                if (pkt->nb_nals > 0) {
+                    // No more start codes: we discarded some irrelevant
+                    // bytes at the end of the packet.
+                    return 0;
+                } else {
+                    av_log(logctx, AV_LOG_ERROR, "No start code is found.\n");
+                    return AVERROR_INVALIDDATA;
+                }
+            }
+
+            extract_length = FFMIN(bytestream2_get_bytes_left(&bc), next_avc - bytestream2_tell(&bc));
+
+            if (bytestream2_tell(&bc) >= next_avc) {
+                /* skip to the start of the next NAL */
+                bytestream2_skip(&bc, next_avc - bytestream2_tell(&bc));
+                continue;
+            }
+        }
+
+        if (pkt->nals_allocated < pkt->nb_nals + 1) {
+            int new_size = pkt->nals_allocated + 1;
+            void *tmp;
+
+            if (new_size >= INT_MAX / sizeof(*pkt->nals))
+                return AVERROR(ENOMEM);
+
+            tmp = av_fast_realloc(pkt->nals, &pkt->nal_buffer_size, new_size * sizeof(*pkt->nals));
+            if (!tmp)
+                return AVERROR(ENOMEM);
+
+            pkt->nals = tmp;
+            memset(pkt->nals + pkt->nals_allocated, 0, sizeof(*pkt->nals));
+
+            nal = &pkt->nals[pkt->nb_nals];
+            nal->skipped_bytes_pos_size = FFMIN(1024, extract_length/3+1); // initial buffer size
+            nal->skipped_bytes_pos = av_malloc_array(nal->skipped_bytes_pos_size, sizeof(*nal->skipped_bytes_pos));
+            if (!nal->skipped_bytes_pos)
+                return AVERROR(ENOMEM);
+
+            pkt->nals_allocated = new_size;
+        }
+        nal = &pkt->nals[pkt->nb_nals];
+
+        consumed = ff_h2645_extract_rbsp(bc.buffer, extract_length, &pkt->rbsp, nal, small_padding);
+        if (consumed < 0)
+            return consumed;
+
+        if (is_nalff && (extract_length != consumed) && extract_length)
+            av_log(logctx, AV_LOG_DEBUG,
+                   "NALFF: Consumed only %d bytes instead of %d\n",
+                   consumed, extract_length);
+
+        bytestream2_skip(&bc, consumed);
+
+        /* see commit 3566042a0 */
+        if (bytestream2_get_bytes_left(&bc) >= 4 &&
+            bytestream2_peek_be32(&bc) == 0x000001E0)
+            skip_trailing_zeros = 0;
+
+        nal->size_bits = get_bit_length(nal, 1 + (codec_id == AV_CODEC_ID_HEVC),
+                                        skip_trailing_zeros);
+
+        if (nal->size <= 0 || nal->size_bits <= 0)
+            continue;
+
+        ret = init_get_bits(&nal->gb, nal->data, nal->size_bits);
+        if (ret < 0)
+            return ret;
+
+        /* Reset type in case it contains a stale value from a previously parsed NAL */
+        nal->type = 0;
+
+        if (codec_id == AV_CODEC_ID_HEVC)
+            ret = hevc_parse_nal_header(nal, logctx);
+        else
+            ret = h264_parse_nal_header(nal, logctx);
+        if (ret < 0) {
+            av_log(logctx, AV_LOG_WARNING, "Invalid NAL unit %d, skipping.\n",
+                   nal->type);
+            continue;
+        }
+
+        pkt->nb_nals++;
+    }
+
+    return 0;
+}
+#endif
+static int decode_nal_units(const uint8_t *buf, int buf_size, int is_evc, int nal_length_size,
+                                 int err_recognition, int apply_defdispwin, void *logctx)
+{
+    // parse_nal_units(AVCodecParserContext *s, const uint8_t *buf,
+    //                        int buf_size, AVCodecContext *avctx)
+    return 0;
+}
+
+static int decode_extradata(const uint8_t *data, int size, int *is_evc, int *nal_length_size,
+                             int err_recognition, int apply_defdispwin, void *logctx)
+{
+    int ret = 0;
+    GetByteContext gb;
+
+    bytestream2_init(&gb, data, size);
+
+
+    if (!data || size <= 0)
+        return -1;
+    // It seems the extradata is encoded as hvcC format.
+    if (data[0] == 1) {
+        av_log(logctx, AV_LOG_ERROR, "+ + + + + + + + [evcC] EVC\n");
+        int num_of_arrays;  // indicates the number of arrays of NAL units of the indicated type(s)
+        
+        int nalu_length_field_size;  // indicates the length in bytes of the NALUnitLenght field in EVC video stream sample in the stream
+                                     // The value of this field shall be one of 0, 1, or 3 corresponding to a length encoded with 1, 2, or 4 bytes, respectively.
+
+        *is_evc = 1;
+
+        if (bytestream2_get_bytes_left(&gb) < 18) {
+            av_log(logctx, AV_LOG_ERROR, "evcC %d too short\n", size);
+            return AVERROR_INVALIDDATA;
+        }
+
+        bytestream2_skip(&gb, 16);
+
+        nalu_length_field_size = (bytestream2_get_byte(&gb) & 3) + 1; 
+        num_of_arrays = bytestream2_get_byte(&gb);
+
+        av_log(logctx, AV_LOG_ERROR, "[evcC] nalu_length_field_size: %d\n", nalu_length_field_size);
+        av_log(logctx, AV_LOG_ERROR, "[evcC] num_of_arrays: %d \n", num_of_arrays);
+
+        /* nal units in the evcC always have length coded with 2 bytes,
+         * so put a fake nal_length_size = 2 while parsing them */
+        *nal_length_size = 2;
+
+        /* Decode nal units from evcC. */
+        for (int i = 0; i < num_of_arrays; i++) {
+
+            int nalu_type = bytestream2_get_byte(&gb) & 0x3f;
+            int num_nalus  = bytestream2_get_be16(&gb);
+            av_log(logctx, AV_LOG_ERROR, "[evcC] nalu_type: %d \n", nalu_type);
+            av_log(logctx, AV_LOG_ERROR, "[evcC] num_nalus: %d \n", num_nalus);
+
+            for (int j = 0; j < num_nalus; j++) {
+
+                // +2 for the nal size field
+                int nal_unit_length = bytestream2_peek_be16(&gb);// + 2;
+                if (bytestream2_get_bytes_left(&gb) < nal_unit_length) {
+                    av_log(logctx, AV_LOG_ERROR, "Invalid NAL unit size in extradata.\n");
+                    return AVERROR_INVALIDDATA;
+                }
+                av_log(logctx, AV_LOG_ERROR, "[evcC] nal_unit_length: %d \n", nal_unit_length);
+
+                // ret = hevc_decode_nal_units(gb.buffer, nalsize, ps, sei, *is_nalff,
+                //                             *nal_length_size, err_recognition, apply_defdispwin,
+                //                             logctx);
+                // if (ret < 0) {
+                //     av_log(logctx, AV_LOG_ERROR,
+                //            "Decoding nal unit %d %d from hvcC failed\n",
+                //            type, i);
+                //     return ret;
+                // }
+                bytestream2_skip(&gb, nal_unit_length);
+            }
+        }
+        /* Now store right nal length size, that will be used to parse
+         * all other nals */
+        *nal_length_size = nalu_length_field_size;
+    } else {
+        av_log(logctx, AV_LOG_ERROR, "- - - - - - - - [evcC] EVC\n");
+        *is_evc = 0;
+    }
+#if 0
+    if (size > 3 && (data[0] || data[1] || data[2] > 1)) {
+        /* It seems the extradata is encoded as hvcC format.
+         * Temporarily, we support configurationVersion==0 until 14496-15 3rd
+         * is finalized. When finalized, configurationVersion will be 1 and we
+         * can recognize hvcC by checking if avctx->extradata[0]==1 or not. */
+        int i, j, num_arrays, nal_len_size;
+
+        *is_nalff = 1;
+
+        bytestream2_skip(&gb, 21);
+        nal_len_size = (bytestream2_get_byte(&gb) & 3) + 1;
+        num_arrays   = bytestream2_get_byte(&gb);
+
+        /* nal units in the hvcC always have length coded with 2 bytes,
+         * so put a fake nal_length_size = 2 while parsing them */
+        *nal_length_size = 2;
+
+        /* Decode nal units from hvcC. */
+        for (i = 0; i < num_arrays; i++) {
+            int type = bytestream2_get_byte(&gb) & 0x3f;
+            int cnt  = bytestream2_get_be16(&gb);
+
+            for (j = 0; j < cnt; j++) {
+                // +2 for the nal size field
+                int nalsize = bytestream2_peek_be16(&gb) + 2;
+                if (bytestream2_get_bytes_left(&gb) < nalsize) {
+                    av_log(logctx, AV_LOG_ERROR,
+                           "Invalid NAL unit size in extradata.\n");
+                    return AVERROR_INVALIDDATA;
+                }
+
+                ret = hevc_decode_nal_units(gb.buffer, nalsize, ps, sei, *is_nalff,
+                                            *nal_length_size, err_recognition, apply_defdispwin,
+                                            logctx);
+                if (ret < 0) {
+                    av_log(logctx, AV_LOG_ERROR,
+                           "Decoding nal unit %d %d from hvcC failed\n",
+                           type, i);
+                    return ret;
+                }
+                bytestream2_skip(&gb, nalsize);
+            }
+        }
+
+        /* Now store right nal length size, that will be used to parse
+         * all other nals */
+        *nal_length_size = nal_len_size;
+    } else {
+        *is_nalff = 0;
+        ret = hevc_decode_nal_units(data, size, ps, sei, *is_nalff, *nal_length_size,
+                                    err_recognition, apply_defdispwin, logctx);
+        if (ret < 0)
+            return ret;
+    }
+#endif
+    return ret;
+}
+
 static int parse_nal_unit_type(AVCodecParserContext *s, const uint8_t *buf,
                                int buf_size, AVCodecContext *avctx)
 {
@@ -926,6 +1204,8 @@ static int parse_nal_unit(AVCodecParserContext *s, const uint8_t *buf,
         s->coded_height        = sps->pic_height_in_luma_samples;
         s->width               = sps->pic_width_in_luma_samples  - sps->picture_crop_left_offset - sps->picture_crop_right_offset;
         s->height              = sps->pic_height_in_luma_samples - sps->picture_crop_top_offset  - sps->picture_crop_bottom_offset;
+        
+        av_log(avctx, AV_LOG_ERROR, "************** PARSE SPS type: %d  | size: %d\n", nalu_type, nalu_size);
 
         SubGopLength = (int)pow(2.0, sps->log2_sub_gop_length);
         avctx->gop_size = SubGopLength;
@@ -1361,6 +1641,13 @@ static int evc_parse(AVCodecParserContext *s, AVCodecContext *avctx,
     EVCParserContext *ev = s->priv_data;
     ParseContext *pc = &ev->pc;
 
+    if (avctx->extradata && !ev->parsed_extradata) {
+        av_log(avctx, AV_LOG_ERROR, "-------------- PARSE EXTRADATA extradata_size: %d\n", avctx->extradata_size);
+        decode_extradata(avctx->extradata, avctx->extradata_size, &ev->is_evc, &ev->nal_length_size, avctx->err_recognition,
+                                  1, avctx);
+        ev->parsed_extradata = 1;
+    }
+
     if (s->flags & PARSER_FLAG_COMPLETE_FRAMES)
         next = buf_size;
     else {
@@ -1393,7 +1680,7 @@ static int evc_parser_init(AVCodecParserContext *s)
     return 0;
 }
 
-static int evc_parser_close(AVCodecParserContext *s)
+static void evc_parser_close(AVCodecParserContext *s)
 {
     EVCParserContext *ev = s->priv_data;
     ev->incomplete_nalu_prefix_read = 0;
@@ -1410,8 +1697,6 @@ static int evc_parser_close(AVCodecParserContext *s)
         av_freep(&pps);
         av_freep(&sh);
     }
-
-    return 0;
 }
 
 const AVCodecParser ff_evc_parser = {
