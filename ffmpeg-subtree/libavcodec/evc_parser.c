@@ -1034,7 +1034,7 @@ static int decode_extradata(const uint8_t *data, int size, int *is_evc, int *nal
             for (int j = 0; j < num_nalus; j++) {
 
                 // +2 for the nal size field
-                int nal_unit_length = bytestream2_peek_be16(&gb);// + 2;
+                int nal_unit_length = bytestream2_get_be16(&gb);// + 2;
                 if (bytestream2_get_bytes_left(&gb) < nal_unit_length) {
                     av_log(logctx, AV_LOG_ERROR, "Invalid NAL unit size in extradata.\n");
                     return AVERROR_INVALIDDATA;
