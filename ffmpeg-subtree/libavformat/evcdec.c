@@ -205,6 +205,8 @@ typedef struct EVCDemuxContext {
     const AVClass *class;
     AVRational framerate;
 
+    AVBSFContext *bsf;
+
     int profile;
 
     EVCParserSPS *sps[EVC_MAX_SPS_COUNT];
@@ -692,6 +694,7 @@ static int evc_read_header(AVFormatContext *s)
 {
     AVStream *st;
     FFStream *sti;
+    const AVBitStreamFilter *filter = av_bsf_get_by_name("evc_frame_merge");
     EVCDemuxContext *c = s->priv_data;
     int ret = 0;
 
@@ -714,6 +717,18 @@ static int evc_read_header(AVFormatContext *s)
 
     // taken from rawvideo demuxers
     avpriv_set_pts_info(st, 64, 1, 1200000);
+
+    ret = av_bsf_alloc(filter, &c->bsf);
+    if (ret < 0)
+        return ret;
+
+    ret = avcodec_parameters_copy(c->bsf->par_in, st->codecpar);
+    if (ret < 0)
+        return ret;
+
+    ret = av_bsf_init(c->bsf);
+    if (ret < 0)
+        return ret;
 
 fail:
     return ret;
@@ -909,6 +924,8 @@ static int evc_read_packet(AVFormatContext *s, AVPacket *pkt)
 
     int32_t nalu_size;
     int au_end_found;
+    
+    EVCDemuxContext *const c = s->priv_data;
 
     int eof = avio_feof (s->pb);
     if(eof) {
@@ -964,19 +981,39 @@ static int evc_read_packet(AVFormatContext *s, AVPacket *pkt)
             return ret;
         }
 
+        ret = av_bsf_send_packet(c->bsf, pkt);
+        if (ret < 0) {
+            av_log(s, AV_LOG_ERROR, "Failed to send packet to "
+                                    "av1_frame_merge filter\n");
+            return ret;
+        }
+
+        ret = av_bsf_receive_packet(c->bsf, pkt);
+        if (ret < 0 && ret != AVERROR(EAGAIN) && ret != AVERROR_EOF)
+            av_log(s, AV_LOG_ERROR, "av1_frame_merge filter failed to "
+                                    "send output packet\n");
+
         // parse NAL unit is neede to determine whether we found end of AU
         parse_nal_unit(pkt->data + bytes_read, nalu_size, s);
         au_end_found = end_of_access_unit_found(pkt->data + bytes_read, nalu_size, s);
 
         bytes_read += nalu_size;
     }
+
     av_shrink_packet(pkt, bytes_read);
+
+    //if (ret == AVERROR(EAGAIN))
+    //    goto retry;
+
 
     return ret;
 }
 
 static int evc_read_close(AVFormatContext *s)
 {
+    EVCDemuxContext *const c = s->priv_data;
+
+    av_bsf_free(&c->bsf);
     return 0;
 }
 
