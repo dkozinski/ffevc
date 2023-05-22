@@ -1,7 +1,5 @@
 /*
- * RAW EVC video demuxer
- *
- * Copyright (c) 2021 Dawid Kozinski <d.kozinski@samsung.com>
+ * Copyright (c) 2019 James Almer <jamrial@gmail.com>
  *
  * This file is part of FFmpeg.
  *
@@ -19,19 +17,13 @@
  * License along with FFmpeg; if not, write to the Free Software
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
+#include "get_bits.h"
+#include "golomb.h"
+#include "bsf.h"
+#include "bsf_internal.h"
+#include "avcodec.h"
 
-#include "libavcodec/get_bits.h"
-#include "libavcodec/golomb.h"
-#include "libavcodec/internal.h"
-#include "libavcodec/evc.h"
-#include "libavcodec/bsf.h"
-
-#include "libavutil/opt.h"
-
-#include "rawdec.h"
-#include "avformat.h"
-#include "internal.h"
-
+#include "evc.h"
 
 #define RAW_PACKET_SIZE 1024
 
@@ -186,27 +178,16 @@ typedef struct EVCParserSliceHeader {
 
 } EVCParserSliceHeader;
 
-
 typedef struct EVCParserPoc {
     int PicOrderCntVal;     // current picture order count value
     int prevPicOrderCntVal; // the picture order count of the previous Tid0 picture
     int DocOffset;          // the decoding order count of the previous picture
 } EVCParserPoc;
 
-typedef struct EVCParserContext {
-    int got_sps;
-    int got_pps;
-    int got_idr;
-    int got_nonidr;
-
-} EVCParserContext;
-
-typedef struct EVCDemuxContext {
-    const AVClass *class;
-    AVRational framerate;
-
-    AVBSFContext *bsf;
-
+typedef struct EVCMergeContext {
+    // CodedBitstreamFragment frag[2];
+    AVPacket *pkt, *in;
+    
     int profile;
 
     EVCParserSPS *sps[EVC_MAX_SPS_COUNT];
@@ -215,24 +196,10 @@ typedef struct EVCDemuxContext {
     EVCParserPoc poc;
     int nalu_type;                  // the current NALU type
     int nalu_size;                  // the current NALU size
+
     int key_frame;
 
-} EVCDemuxContext;
-
-#define DEC AV_OPT_FLAG_DECODING_PARAM
-#define OFFSET(x) offsetof(EVCDemuxContext, x)
-static const AVOption evc_options[] = {
-    { "framerate", "", OFFSET(framerate), AV_OPT_TYPE_VIDEO_RATE, {.str = "25"}, 0, INT_MAX, DEC},
-    { NULL },
-};
-#undef OFFSET
-
-static const AVClass evc_demuxer_class = {
-    .class_name = "EVC Annex B demuxer",
-    .item_name  = av_default_item_name,
-    .option     = evc_options,
-    .version    = LIBAVUTIL_VERSION_INT,
-};
+} EVCMergeContext;
 
 // nuh_temporal_id specifies a temporal identifier for the NAL unit
 static int get_temporal_id(const uint8_t *bits, int bits_size)
@@ -292,9 +259,9 @@ static uint32_t read_nal_unit_length(const uint8_t *bits, int bits_size)
     return nalu_len;
 }
 
-static int end_of_access_unit_found(const uint8_t *bits, int bits_size, AVFormatContext *s)
+static int end_of_access_unit_found(AVBSFContext *s)
 {
-    EVCDemuxContext *ctx = s->priv_data;
+    EVCMergeContext *ctx = s->priv_data;
 
     if (ctx->profile == 0) { // BASELINE profile
         if (ctx->nalu_type == EVC_NOIDR_NUT || ctx->nalu_type == EVC_IDR_NUT)
@@ -310,7 +277,7 @@ static int end_of_access_unit_found(const uint8_t *bits, int bits_size, AVFormat
 }
 
 // @see ISO_IEC_23094-1 (7.3.2.1 SPS RBSP syntax)
-static EVCParserSPS *parse_sps(const uint8_t *bs, int bs_size, EVCDemuxContext *ev)
+static EVCParserSPS *parse_sps(const uint8_t *bs, int bs_size, EVCMergeContext *ev)
 {
     GetBitContext gb;
     EVCParserSPS *sps;
@@ -422,7 +389,7 @@ static EVCParserSPS *parse_sps(const uint8_t *bs, int bs_size, EVCDemuxContext *
 // If it will be needed, parse_sps function could be extended to handle VUI parameters parsing
 // to initialize fields of the AVCodecContex i.e. color_primaries, color_trc,color_range
 //
-static EVCParserPPS *parse_pps(const uint8_t *bs, int bs_size, EVCDemuxContext *ev)
+static EVCParserPPS *parse_pps(const uint8_t *bs, int bs_size, EVCMergeContext *ev)
 {
     GetBitContext gb;
     EVCParserPPS *pps;
@@ -493,7 +460,7 @@ static EVCParserPPS *parse_pps(const uint8_t *bs, int bs_size, EVCDemuxContext *
 }
 
 // @see ISO_IEC_23094-1 (7.3.2.6 Slice layer RBSP syntax)
-static EVCParserSliceHeader *parse_slice_header(const uint8_t *bs, int bs_size, EVCDemuxContext *ev)
+static EVCParserSliceHeader *parse_slice_header(const uint8_t *bs, int bs_size, EVCMergeContext *ev)
 {
     GetBitContext gb;
     EVCParserSliceHeader *sh;
@@ -616,161 +583,13 @@ static EVCParserSliceHeader *parse_slice_header(const uint8_t *bs, int bs_size, 
     return sh;
 }
 
-static int parse_nal_units(const AVProbeData *p, EVCParserContext *ev)
-{
-    int nalu_type;
-    size_t nalu_size;
-    unsigned char *bits = (unsigned char *)p->buf;
-    int bytes_to_read = p->buf_size;
-
-    while (bytes_to_read > EVC_NALU_LENGTH_PREFIX_SIZE) {
-
-        nalu_size = read_nal_unit_length(bits, EVC_NALU_LENGTH_PREFIX_SIZE);
-        if (nalu_size == 0) break;
-
-        bits += EVC_NALU_LENGTH_PREFIX_SIZE;
-        bytes_to_read -= EVC_NALU_LENGTH_PREFIX_SIZE;
-
-        if(bytes_to_read < nalu_size) break;
-
-        nalu_type = get_nalu_type(bits, bytes_to_read);
-
-        if (nalu_type == EVC_SPS_NUT)
-            ev->got_sps++;
-        else if (nalu_type == EVC_PPS_NUT)
-            ev->got_pps++;
-        else if (nalu_type == EVC_IDR_NUT )
-            ev->got_idr++;
-        else if (nalu_type == EVC_NOIDR_NUT)
-            ev->got_nonidr++;
-
-        bits += nalu_size;
-        bytes_to_read -= nalu_size;
-    }
-
-    return 0;
-}
-
-static int annexb_probe(const AVProbeData *p)
-{
-    EVCParserContext ev = {0};
-    int ret = parse_nal_units(p, &ev);
-
-    if (ret == 0 && ev.got_sps && ev.got_pps && (ev.got_idr || ev.got_nonidr > 3))
-        return AVPROBE_SCORE_EXTENSION + 1;  // 1 more than .mpg
-
-    return 0;
-}
-
-static int annexb_read_header(AVFormatContext *s)
-{
-    AVStream *st;
-    FFStream *sti;
-    EVCDemuxContext *c = s->priv_data;
-    int ret = 0;
-
-    st = avformat_new_stream(s, NULL);
-    if (!st) {
-        ret = AVERROR(ENOMEM);
-        goto fail;
-    }
-    sti = ffstream(st);
-
-    st->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
-    st->codecpar->codec_id = AV_CODEC_ID_EVC;
-    sti->need_parsing = AVSTREAM_PARSE_FULL_RAW;
-
-    st->avg_frame_rate = c->framerate;
-    sti->avctx->framerate = c->framerate;
-
-    // taken from rawvideo demuxers
-    avpriv_set_pts_info(st, 64, 1, 1200000);
-
-fail:
-    return ret;
-}
-
-static int evc_read_header(AVFormatContext *s)
-{
-    AVStream *st;
-    FFStream *sti;
-    const AVBitStreamFilter *filter = av_bsf_get_by_name("evc_frame_merge");
-    EVCDemuxContext *c = s->priv_data;
-    int ret = 0;
-
-    st = avformat_new_stream(s, NULL);
-    if (!st) {
-        ret = AVERROR(ENOMEM);
-        goto fail;
-    }
-    sti = ffstream(st);
-
-    st->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
-    st->codecpar->codec_id = AV_CODEC_ID_EVC;
-
-    // This causes sending to the parser full frames, not chunks of data
-    // The flag PARSER_FLAG_COMPLETE_FRAMES will be set in demux.c (demux.c: 1316)
-    sti->need_parsing = AVSTREAM_PARSE_HEADERS;
-
-    st->avg_frame_rate = c->framerate;
-    sti->avctx->framerate = c->framerate;
-
-    // taken from rawvideo demuxers
-    avpriv_set_pts_info(st, 64, 1, 1200000);
-
-    ret = av_bsf_alloc(filter, &c->bsf);
-    if (ret < 0)
-        return ret;
-
-    ret = avcodec_parameters_copy(c->bsf->par_in, st->codecpar);
-    if (ret < 0)
-        return ret;
-
-    ret = av_bsf_init(c->bsf);
-    if (ret < 0)
-        return ret;
-
-fail:
-    return ret;
-}
-
-static int annexb_read_packet(AVFormatContext *s, AVPacket *pkt)
-{
-    int ret, pkt_size;
-    int eof;
-
-    pkt_size = RAW_PACKET_SIZE;
-
-    eof = avio_feof (s->pb);
-    if(eof) {
-        av_packet_unref(pkt);
-        return AVERROR_EOF;
-    }
-
-    if ((ret = av_new_packet(pkt, pkt_size)) < 0)
-        return ret;
-
-    pkt->pos = avio_tell(s->pb);
-    pkt->stream_index = 0;
-    ret = avio_read_partial(s->pb, pkt->data, pkt_size);
-    if (ret < 0) {
-        av_packet_unref(pkt);
-        return ret;
-    }
-    av_shrink_packet(pkt, ret);
-
-    av_log(s, AV_LOG_ERROR, "annexb_read_packet: %d\n", pkt_size);
-
-    return ret;
-}
-
-static int parse_nal_unit(const uint8_t *buf, size_t buf_size, AVFormatContext *s)
+static int parse_nal_unit(const uint8_t *buf, size_t buf_size, AVBSFContext *s)
 {
     int nalu_type, nalu_size;
     int tid;
     const uint8_t *data = buf;
     int data_size = buf_size;
-    EVCDemuxContext *ev = s->priv_data;
+    EVCMergeContext *ev = s->priv_data;
 
     nalu_size = buf_size;
     if (nalu_size <= 0) {
@@ -914,135 +733,104 @@ static int parse_nal_unit(const uint8_t *buf, size_t buf_size, AVFormatContext *
     return 0;
 }
 
-static int evc_read_packet(AVFormatContext *s, AVPacket *pkt)
+static void evc_frame_merge_flush(AVBSFContext *bsf)
 {
-    int ret;
-    int pkt_size;
+    EVCMergeContext *ctx = bsf->priv_data;
 
-    int bytes_read = 0;
-    int bytes_left = 0;
-
-    int32_t nalu_size;
-    int au_end_found;
-    
-    EVCDemuxContext *const c = s->priv_data;
-
-    int eof = avio_feof (s->pb);
-    if(eof) {
-        av_packet_unref(pkt);
-        return AVERROR_EOF;
-    }
-
-    // pkt_size = RAW_PACKET_SIZE;
-    // if ((ret = av_new_packet(pkt, pkt_size)) < 0)
-    //      return ret;
-
-    // pkt->pos = avio_tell(s->pb);
-    // pkt->stream_index = 0;
-    au_end_found = 0;
-
-    while(!au_end_found) {
-
-        // bytes_left = pkt_size - bytes_read;
-        // if( bytes_left < EVC_NALU_LENGTH_PREFIX_SIZE ) {
-        //     int grow_by = pkt_size;
-        //     pkt_size = pkt_size * 2;
-        //     av_grow_packet(pkt, grow_by);
-        //     bytes_left = pkt_size - bytes_read;
-        //     av_log(s, AV_LOG_DEBUG, "Resizing packet size to: %d bytes\n", pkt_size);
-        // }
-
-        uint8_t buf[EVC_NALU_LENGTH_PREFIX_SIZE];
-        unsigned char *pbuf = (unsigned char *)&buf;
-        ret = avio_read(s->pb, pbuf, EVC_NALU_LENGTH_PREFIX_SIZE);
-        if (ret < 0) {
-            av_packet_unref(pkt);
-            return ret;
-        }
-
-        nalu_size = read_nal_unit_length(&buf, EVC_NALU_LENGTH_PREFIX_SIZE);
-        if(nalu_size <= 0) {
-            av_packet_unref(pkt);
-            return -1;
-        }
-        
-        avio_seek(s->pb, -EVC_NALU_LENGTH_PREFIX_SIZE, SEEK_CUR);
-
-        // bytes_read += ret;
-
-        // bytes_left = pkt_size - bytes_read;
-        // while( bytes_left < nalu_size ) {
-        //     int grow_by = pkt_size;
-        //     pkt_size = pkt_size * 2;
-        //     av_grow_packet(pkt, grow_by);
-        //     bytes_left = pkt_size - bytes_read;
-        //     av_log(s, AV_LOG_DEBUG, "Resizing packet pkt_size to: %d bytes\n", pkt_size);
-        // }
-
-        // ret = avio_read(s->pb, pkt->data + bytes_read, nalu_size);
-        // if (ret < 0) {
-        //     av_packet_unref(pkt);
-        //     return ret;
-        // }
-
-        
-        ret = av_get_packet(s->pb, pkt, nalu_size + EVC_NALU_LENGTH_PREFIX_SIZE);
-        if (ret < 0)
-            return ret;
-        if (ret != (nalu_size + EVC_NALU_LENGTH_PREFIX_SIZE))
-            return AVERROR(EIO);
-
-
-        ret = av_bsf_send_packet(c->bsf, pkt);
-        if (ret < 0) {
-            av_log(s, AV_LOG_ERROR, "Failed to send packet to "
-                                    "av1_frame_merge filter\n");
-            return ret;
-        }
-
-        ret = av_bsf_receive_packet(c->bsf, pkt);
-        if (ret < 0 && ret != AVERROR(EAGAIN) && ret != AVERROR_EOF)
-            av_log(s, AV_LOG_ERROR, "av1_frame_merge filter failed to "
-                                    "send output packet\n");
-
-        // parse NAL unit is neede to determine whether we found end of AU
-        // parse_nal_unit(pkt->data + bytes_read, nalu_size, s);
-        // au_end_found = end_of_access_unit_found(pkt->data + bytes_read, nalu_size, s);
-
-        // bytes_read += nalu_size;
-
-        if (ret == AVERROR(EAGAIN))
-            au_end_found = 0;
-    }
-
-    av_shrink_packet(pkt, bytes_read);
-
-    //if (ret == AVERROR(EAGAIN))
-    //    goto retry;
-
-
-    return ret;
+    //ff_cbs_fragment_reset(&ctx->frag[0]);
+    //ff_cbs_fragment_reset(&ctx->frag[1]);
+    av_packet_unref(ctx->in);
+    av_packet_unref(ctx->pkt);
 }
 
-static int evc_read_close(AVFormatContext *s)
+static int evc_frame_merge_filter(AVBSFContext *bsf, AVPacket *out)
 {
-    EVCDemuxContext *const c = s->priv_data;
+    EVCMergeContext *ctx = bsf->priv_data;
+    // CodedBitstreamFragment *frag = &ctx->frag[ctx->idx], *tu = &ctx->frag[!ctx->idx];
+    AVPacket *in = ctx->in, *buffer_pkt = ctx->pkt;
+    int err;//, i;
 
-    av_bsf_free(&c->bsf);
+    err = ff_bsf_get_packet_ref(bsf, in);
+    if (err < 0) {
+        //if (err == AVERROR_EOF && tu->nb_units > 0)
+        //    goto eof;
+        return err;
+    }
+    av_log(bsf, AV_LOG_ERROR, "*** Filtering *** size: %d\n", in->size);
+
+
+// eof:
+    // Zapisz output do buffer_pkt
+    // buffer_pkt = av_packet_clone(in);
+
+    size_t  nalu_size = read_nal_unit_length(in->data, EVC_NALU_LENGTH_PREFIX_SIZE);
+    if(nalu_size <= 0) {
+        return -1;
+    }
+    
+    // parse NAL unit is neede to determine whether we found end of AU
+    const uint8_t* nalu = in->data + EVC_NALU_LENGTH_PREFIX_SIZE;
+    nalu_size = in->size - EVC_NALU_LENGTH_PREFIX_SIZE;
+
+    parse_nal_unit(nalu, nalu_size, bsf);
+    int au_end_found = end_of_access_unit_found(bsf);
+
+    if(au_end_found) {
+        av_packet_move_ref(out, buffer_pkt);
+    } else {
+        err = AVERROR(EAGAIN);
+    }
+
+    if (!buffer_pkt->data ||
+        in->pts != AV_NOPTS_VALUE && buffer_pkt->pts == AV_NOPTS_VALUE) {
+        av_packet_unref(buffer_pkt);
+        av_packet_move_ref(buffer_pkt, in);
+    } else
+        av_packet_unref(in);
+
+    // ff_cbs_fragment_reset(&ctx->frag[ctx->idx]);
+
+fail:
+    if (err < 0 && err != AVERROR(EAGAIN))
+        evc_frame_merge_flush(bsf);
+
+    av_log(bsf, AV_LOG_ERROR, "*** Filtering *** err: %d\n", err);
+    return err;
+}
+
+static int evc_frame_merge_init(AVBSFContext *bsf)
+{
+    EVCMergeContext *ctx = bsf->priv_data;
+    // int err;
+
+    ctx->in  = av_packet_alloc();
+    ctx->pkt = av_packet_alloc();
+    if (!ctx->in || !ctx->pkt)
+        return AVERROR(ENOMEM);
+
     return 0;
 }
 
-const AVInputFormat ff_evc_demuxer = {
-    .name           = "evc",
-    .long_name      = NULL_IF_CONFIG_SMALL("EVC Annex B"),
-    .read_probe     = annexb_probe,
-    .read_header    = evc_read_header, // annexb_read_header
-    .read_packet    = evc_read_packet, // annexb_read_packet
-    .read_close     = evc_read_close,
-    .extensions     = "evc",
-    .flags          = AVFMT_GENERIC_INDEX,
-    .flags_internal = FF_FMT_INIT_CLEANUP,
-    .raw_codec_id   = AV_CODEC_ID_EVC,
-    .priv_data_size = sizeof(EVCDemuxContext),
-    .priv_class     = &evc_demuxer_class,
+static void evc_frame_merge_close(AVBSFContext *bsf)
+{
+    EVCMergeContext *ctx = bsf->priv_data;
+
+    // ff_cbs_fragment_free(&ctx->frag[0]);
+    // ff_cbs_fragment_free(&ctx->frag[1]);
+    av_packet_free(&ctx->in);
+    av_packet_free(&ctx->pkt);
+}
+
+static const enum AVCodecID evc_frame_merge_codec_ids[] = {
+    AV_CODEC_ID_EVC, AV_CODEC_ID_NONE,
+};
+
+const FFBitStreamFilter ff_evc_frame_merge_bsf = {
+    .p.name         = "evc_frame_merge",
+    .p.codec_ids    = evc_frame_merge_codec_ids,
+    .priv_data_size = sizeof(EVCMergeContext),
+    .init           = evc_frame_merge_init,
+    .flush          = evc_frame_merge_flush,
+    .close          = evc_frame_merge_close,
+    .filter         = evc_frame_merge_filter,
 };
