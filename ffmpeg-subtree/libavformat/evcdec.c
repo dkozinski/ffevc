@@ -933,53 +933,65 @@ static int evc_read_packet(AVFormatContext *s, AVPacket *pkt)
         return AVERROR_EOF;
     }
 
-    pkt_size = RAW_PACKET_SIZE;
-    if ((ret = av_new_packet(pkt, pkt_size)) < 0)
-        return ret;
+    // pkt_size = RAW_PACKET_SIZE;
+    // if ((ret = av_new_packet(pkt, pkt_size)) < 0)
+    //      return ret;
 
-    pkt->pos = avio_tell(s->pb);
-    pkt->stream_index = 0;
+    // pkt->pos = avio_tell(s->pb);
+    // pkt->stream_index = 0;
     au_end_found = 0;
 
     while(!au_end_found) {
 
-        bytes_left = pkt_size - bytes_read;
-        if( bytes_left < EVC_NALU_LENGTH_PREFIX_SIZE ) {
-            int grow_by = pkt_size;
-            pkt_size = pkt_size * 2;
-            av_grow_packet(pkt, grow_by);
-            bytes_left = pkt_size - bytes_read;
-            av_log(s, AV_LOG_DEBUG, "Resizing packet size to: %d bytes\n", pkt_size);
-        }
+        // bytes_left = pkt_size - bytes_read;
+        // if( bytes_left < EVC_NALU_LENGTH_PREFIX_SIZE ) {
+        //     int grow_by = pkt_size;
+        //     pkt_size = pkt_size * 2;
+        //     av_grow_packet(pkt, grow_by);
+        //     bytes_left = pkt_size - bytes_read;
+        //     av_log(s, AV_LOG_DEBUG, "Resizing packet size to: %d bytes\n", pkt_size);
+        // }
 
-        ret = avio_read(s->pb, pkt->data + bytes_read, EVC_NALU_LENGTH_PREFIX_SIZE);
+        uint8_t buf[EVC_NALU_LENGTH_PREFIX_SIZE];
+        unsigned char *pbuf = (unsigned char *)&buf;
+        ret = avio_read(s->pb, pbuf, EVC_NALU_LENGTH_PREFIX_SIZE);
         if (ret < 0) {
             av_packet_unref(pkt);
             return ret;
         }
 
-        nalu_size = read_nal_unit_length(pkt->data + bytes_read, EVC_NALU_LENGTH_PREFIX_SIZE);
+        nalu_size = read_nal_unit_length(&buf, EVC_NALU_LENGTH_PREFIX_SIZE);
         if(nalu_size <= 0) {
             av_packet_unref(pkt);
             return -1;
         }
+        
+        avio_seek(s->pb, -EVC_NALU_LENGTH_PREFIX_SIZE, SEEK_CUR);
 
-        bytes_read += ret;
+        // bytes_read += ret;
 
-        bytes_left = pkt_size - bytes_read;
-        while( bytes_left < nalu_size ) {
-            int grow_by = pkt_size;
-            pkt_size = pkt_size * 2;
-            av_grow_packet(pkt, grow_by);
-            bytes_left = pkt_size - bytes_read;
-            av_log(s, AV_LOG_DEBUG, "Resizing packet pkt_size to: %d bytes\n", pkt_size);
-        }
+        // bytes_left = pkt_size - bytes_read;
+        // while( bytes_left < nalu_size ) {
+        //     int grow_by = pkt_size;
+        //     pkt_size = pkt_size * 2;
+        //     av_grow_packet(pkt, grow_by);
+        //     bytes_left = pkt_size - bytes_read;
+        //     av_log(s, AV_LOG_DEBUG, "Resizing packet pkt_size to: %d bytes\n", pkt_size);
+        // }
 
-        ret = avio_read(s->pb, pkt->data + bytes_read, nalu_size);
-        if (ret < 0) {
-            av_packet_unref(pkt);
+        // ret = avio_read(s->pb, pkt->data + bytes_read, nalu_size);
+        // if (ret < 0) {
+        //     av_packet_unref(pkt);
+        //     return ret;
+        // }
+
+        
+        ret = av_get_packet(s->pb, pkt, nalu_size + EVC_NALU_LENGTH_PREFIX_SIZE);
+        if (ret < 0)
             return ret;
-        }
+        if (ret != (nalu_size + EVC_NALU_LENGTH_PREFIX_SIZE))
+            return AVERROR(EIO);
+
 
         ret = av_bsf_send_packet(c->bsf, pkt);
         if (ret < 0) {
@@ -994,10 +1006,13 @@ static int evc_read_packet(AVFormatContext *s, AVPacket *pkt)
                                     "send output packet\n");
 
         // parse NAL unit is neede to determine whether we found end of AU
-        parse_nal_unit(pkt->data + bytes_read, nalu_size, s);
-        au_end_found = end_of_access_unit_found(pkt->data + bytes_read, nalu_size, s);
+        // parse_nal_unit(pkt->data + bytes_read, nalu_size, s);
+        // au_end_found = end_of_access_unit_found(pkt->data + bytes_read, nalu_size, s);
 
-        bytes_read += nalu_size;
+        // bytes_read += nalu_size;
+
+        if (ret == AVERROR(EAGAIN))
+            au_end_found = 0;
     }
 
     av_shrink_packet(pkt, bytes_read);
